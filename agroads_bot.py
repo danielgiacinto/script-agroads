@@ -1,5 +1,7 @@
-import unicodedata
+import os
+import sys
 import time
+import unicodedata
 from pathlib import Path
 
 from playwright.sync_api import Page, sync_playwright
@@ -22,6 +24,10 @@ from image_handler import get_images_for_product
 
 
 def run(executable_path: Path, images_folder: Path):
+    if getattr(sys, "frozen", False):
+        browsers_path = Path(sys.executable).parent / "browsers"
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers_path)
+    start_time = time.time()
     products = read_products(executable_path)
     print(f"Publicando {len(products)} productos", flush=True)
     with sync_playwright() as p:
@@ -39,16 +45,24 @@ def run(executable_path: Path, images_folder: Path):
         page.wait_for_load_state("domcontentloaded")
 
         _do_login(page)
-        time.sleep(3)
+        time.sleep(2)
 
         for i, product in enumerate(products):
             try:
-                _publish_product(page, product, images_folder)
+                _publish_product(page, product, images_folder, index=i + 1, total=len(products))
             except Exception as e:
                 print(f"Error publicando producto {i + 1}: {e}")
                 raise
             if i < len(products) - 1:
                 time.sleep(DELAY_SECONDS)
+
+        elapsed = time.time() - start_time
+        if elapsed >= 60:
+            mins = int(elapsed // 60)
+            secs = int(elapsed % 60)
+            print(f"Proceso finalizado correctamente. Tiempo total: {mins} min {secs} seg", flush=True)
+        else:
+            print(f"Proceso finalizado correctamente. Tiempo total: {int(elapsed)} seg", flush=True)
 
         if browser:
             browser.close()
@@ -64,7 +78,7 @@ def _do_login(page: Page):
     page.wait_for_load_state("domcontentloaded")
 
 
-def _publish_product(page: Page, product: dict, images_folder: Path):
+def _publish_product(page: Page, product: dict, images_folder: Path, index: int = 1, total: int = 1):
     if "/publicacion.asp" not in page.url:
         page.get_by_role("link", name="Publicar", exact=True).click()
         page.wait_for_url("**/publicacion.asp**")
@@ -81,8 +95,9 @@ def _publish_product(page: Page, product: dict, images_folder: Path):
         help_el.first.click()
     page.wait_for_timeout(1000)
     page.locator("#publicacion-continuar").click()
-    page.wait_for_url("**paso=3**")
-    print("Producto publicado correctamente.", flush=True)
+    page.wait_for_url("**paso=3**", timeout=90000)
+    titulo = _get(product, "titulo", "Título") or "sin título"
+    print(f"Producto ({titulo}) publicado correctamente {index} de {total}", flush=True)
     page.wait_for_timeout(2000)
 
     page.locator('a[href*="publicacion.asp"]').filter(has_text="otro anuncio").first.click()
@@ -91,7 +106,6 @@ def _publish_product(page: Page, product: dict, images_folder: Path):
 
 
 def _select_category(page: Page, product: dict):
-    print("Producto completo: ", product)
     categoria = _get(product, "categoria", "Categoria")
     tipo = _get(product, "tipo", "Tipo")
     sub_tipo = _get(product, "sub_tipo", "sub tipo", "Sub_tipo")
@@ -190,9 +204,78 @@ def _fill_dto_pago(page: Page, product: dict):
         page.locator("#publicacion-descuento").fill(str(val).strip())
 
 
+def _fill_condiciones_comerciales(page: Page):
+    try:
+        section = page.locator(".form-section:has(#publicacion-condicion-comercial-10)")
+        if section.count() > 0:
+            section.first.scroll_into_view_if_needed()
+        page.locator("h3.section-title:has-text('Financiación')").first.click()
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+    def _click_icheck(checkbox_id: str):
+        try:
+            box = page.locator(f"div.icheckbox_square:has(input#{checkbox_id})").first
+            if box.count() > 0:
+                box.click(force=True)
+                page.wait_for_timeout(200)
+        except Exception:
+            pass
+
+    try:
+        _click_icheck("publicacion-condicion-comercial-10")
+        val10 = page.locator("#publicacion-condicion-comercial-value-10")
+        if val10.count() > 0:
+            val10.first.fill("6")
+            page.wait_for_timeout(200)
+    except Exception:
+        pass
+    try:
+        _click_icheck("publicacion-condicion-comercial-6")
+        val6 = page.locator("#publicacion-condicion-comercial-value-6")
+        if val6.count() > 0:
+            val6.first.fill("30")
+            page.wait_for_timeout(200)
+    except Exception:
+        pass
+    try:
+        _click_icheck("publicacion-condicion-comercial-9")
+        val9 = page.locator("#publicacion-condicion-comercial-value-9")
+        if val9.count() > 0:
+            val9.first.fill("0")
+            page.wait_for_timeout(200)
+    except Exception:
+        pass
+    try:
+        _click_icheck("publicacion-condicion-comercial-4")
+    except Exception:
+        pass
+    try:
+        _click_icheck("publicacion-condicion-comercial-11")
+    except Exception:
+        pass
+    try:
+        _click_icheck("publicacion-condicion-comercial-2")
+    except Exception:
+        pass
+    try:
+        sel_principal = page.locator("#condicion-comercial-principal")
+        if sel_principal.count() > 0:
+            sel_principal.first.select_option(value="11")
+            page.wait_for_timeout(200)
+    except Exception:
+        pass
+    try:
+        sel_secundaria = page.locator("#condicion-comercial-secundaria")
+        if sel_secundaria.count() > 0:
+            sel_secundaria.first.select_option(value="9")
+    except Exception:
+        pass
+
+
 def _fill_condicion(page: Page, product: dict):
     val = _get(product, "condicion", "estado")
-    print(f"Condicion: {val}", flush=True)
     if not val:
         return
     v = _normalize_text(str(val))
@@ -264,23 +347,6 @@ def _fill_modelo(page: Page, product: dict):
             pass
     modelo_sel.select_option(value="0")
 
-
-def _fill_combustible(page: Page, product: dict):
-    val = _get(product, "combustible", "Combustible")
-    if not val:
-        return
-    combustibles = page.locator("#publicacion-combustible")
-    if combustibles.count() == 0:
-        return
-    v = _normalize_text(str(val))
-    if v in ("nafta", "1"):
-        combustibles.select_option(value="1")
-    elif v in ("diesel", "gasoil", "2"):
-        combustibles.select_option(value="2")
-    elif "gnc" in v or v == "3":
-        combustibles.select_option(value="3")
-
-
 def _fill_hp(page: Page, product: dict):
     hp_el = page.locator("#publicacion-hp")
     if hp_el.count() == 0 or not hp_el.is_visible():
@@ -311,13 +377,29 @@ def _fill_descripcion(page: Page, product: dict):
         desc_el.first.fill(str(val))
 
 
+def _fill_ubicacion(page: Page, product: dict):
+    val = _get(product, "ubicacion", "ubicación", "Ubicacion", "Ubicación")
+    if not val or str(val).strip() == "":
+        val = "Córdoba, Córdoba"
+    ubic_el = page.locator("#publicacion-ubicacion")
+    if ubic_el.count() > 0:
+        ubic_el.first.fill(str(val).strip())
+        page.wait_for_timeout(800)
+        sugerencia = page.locator("ul.ui-autocomplete.ui-menu li.ui-menu-item a").first
+        try:
+            sugerencia.wait_for(state="visible", timeout=3000)
+            sugerencia.click()
+        except Exception:
+            page.keyboard.press("Tab")
+
+
 def _fill_form(page: Page, product: dict, images_folder: Path):
-    print(f"Llenando formulario para el producto: {product}", flush=True)
     # Llena los campos del formulario de Agroads
     _fill_titulo(page, product)
     _fill_moneda(page, product)
     _fill_monto(page, product)
     _fill_dto_pago(page, product)
+    _fill_condiciones_comerciales(page)
 
     product_id = _get(product, "id", "ID")
     if product_id:
@@ -329,14 +411,14 @@ def _fill_form(page: Page, product: dict, images_folder: Path):
     _fill_marca(page, product)
     _fill_modelo(page, product)
     _fill_anio(page, product)
-    _fill_combustible(page, product)
     _fill_hp(page, product)
     _fill_horas(page, product)
     _fill_descripcion(page, product)
+    _fill_ubicacion(page, product)
 
     for key, value in product.items():
         key_lower = str(key).lower().strip()
-        skip = ("id", "categoria", "tipo", "sub_tipo", "sub_sub_tipo", "titulo", "moneda", "monto", "dto_pago", "condicion", "marca", "modelo", "ano", "combustible", "hp", "horas", "descripcion")
+        skip = ("id", "categoria", "tipo", "sub_tipo", "sub_sub_tipo", "titulo", "moneda", "monto", "dto_pago", "condicion", "marca", "modelo", "ano", "combustible", "hp", "horas", "descripcion", "ubicacion")
         if key_lower in skip or value == "" or value is None:
             continue
         _fill_field(page, key, value)

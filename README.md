@@ -53,3 +53,17 @@ fotos/
 1. Ejecutar: `python main.py`
 
 El script abre un navegador Chromium. Si usás `BROWSER_USER_DATA`, la primera vez deberás iniciar sesión en Agroads manualmente; las ejecuciones siguientes reutilizarán la sesión. Luego el bot pulsa "Publicar", completa el formulario para cada fila del Excel y sube las fotos de cada carpeta.
+
+## Generar ejecutable (.exe) para distribución
+
+Para crear un ejecutable que el cliente pueda usar sin instalar Python:
+
+1. Ejecutar: `build.bat` (o `pyinstaller agroads_bot.spec --noconfirm`)
+2. La carpeta `dist/AgroadsBot/` contendrá `AgroadsBot.exe` y dependencias
+3. Para entregar al cliente: comprimir esa carpeta y dentro incluir:
+   - `AgroadsBot.exe` (y todos los archivos generados)
+   - `.env` (con credenciales configuradas)
+   - `datos.xlsx` (el Excel del cliente)
+   - carpeta `fotos/` con subcarpetas `1/`, `2/`, etc.
+
+El cliente ejecuta `AgroadsBot.exe` desde esa carpeta. La primera vez, Playwright descargará Chromium (~150 MB) automáticamente si no está instalado.

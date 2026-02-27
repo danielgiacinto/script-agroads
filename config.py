@@ -1,15 +1,19 @@
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-_env_path = Path(__file__).resolve().parent / ".env"
-load_dotenv(dotenv_path=_env_path)
+if getattr(sys, "frozen", False):
+    PROJECT_ROOT = Path(sys.executable).resolve().parent
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parent
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+_env_path = PROJECT_ROOT / ".env"
+load_dotenv(dotenv_path=_env_path)
 EXCEL_PATH = Path(os.getenv("EXCEL_PATH", PROJECT_ROOT / "datos.xlsx"))
 IMAGES_FOLDER = Path(os.getenv("IMAGES_FOLDER", PROJECT_ROOT / "fotos"))
-DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "10"))
+DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "6"))
 AGROADS_BASE_URL = os.getenv("AGROADS_BASE_URL", "https://www.agroads.com.ar")
 AGROADS_EMAIL = os.getenv("AGROADS_EMAIL", "")
 AGROADS_PASSWORD = os.getenv("AGROADS_PASSWORD", "")
