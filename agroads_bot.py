@@ -1,15 +1,24 @@
 import os
+import re
 import sys
 import time
 import unicodedata
 from pathlib import Path
 
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Page, sync_playwright, TimeoutError as PlaywrightTimeout
 
 # Funcion para normalizar texto ignorando acentos
 def _normalize_text(s: str) -> str:
     n = unicodedata.normalize("NFD", s)
     return "".join(c for c in n if unicodedata.category(c) != "Mn").lower()
+
+
+def _normalize_modelo(s: str) -> str:
+    t = str(s).strip()
+    for c in ("›", "»", "‹", "«"):
+        t = t.replace(c, ">")
+    t = re.sub(r"\s+", " ", t)
+    return _normalize_text(t)
 
 from config import (
     AGROADS_BASE_URL,
@@ -46,6 +55,13 @@ def run(executable_path: Path, images_folder: Path):
 
         _do_login(page)
         time.sleep(2)
+        try:
+            btn_entendido = page.get_by_role("button", name="Entendido")
+            btn_entendido.wait_for(state="visible", timeout=3000)
+            btn_entendido.click()
+            page.wait_for_timeout(500)
+        except Exception:
+            pass
 
         for i, product in enumerate(products):
             try:
@@ -79,6 +95,10 @@ def _do_login(page: Page):
 
 
 def _publish_product(page: Page, product: dict, images_folder: Path, index: int = 1, total: int = 1):
+    titulo_short = _get(product, "titulo", "Título") or "sin título"
+    if len(titulo_short) > 50:
+        titulo_short = titulo_short[:47] + "..."
+    print(f"[{index}/{total}] Procesando: {titulo_short}", flush=True)
     if "/publicacion.asp" not in page.url:
         page.get_by_role("link", name="Publicar", exact=True).click()
         page.wait_for_url("**/publicacion.asp**")
@@ -87,21 +107,70 @@ def _publish_product(page: Page, product: dict, images_folder: Path, index: int 
     _select_category(page, product)
     page.wait_for_url("**paso=2**")
     page.wait_for_load_state("domcontentloaded")
+    print(f"[{index}/{total}] Completando formulario...", flush=True)
 
     _fill_form(page, product, images_folder)
 
+    print(f"[{index}/{total}] Esperando que las fotos terminen de subir...", flush=True)
+    try:
+        page.wait_for_function(
+            """
+            () => {
+              const items = Array.from(document.querySelectorAll('ul.ui-sortable li.imagen[data-nueva]'));
+              if (items.length === 0) return true;
+              return items.every(li => {
+                const cargando = li.querySelector('.foto-cargando');
+                const ok = li.querySelector('.foto-ok.imagen-sube');
+                const pct = cargando && cargando.querySelector('.porcentaje');
+                const cargandoVisible = cargando && getComputedStyle(cargando).display !== 'none';
+                if (cargandoVisible) return false;
+                if (pct && pct.textContent.trim() !== '100%') return false;
+                return !!ok && getComputedStyle(ok).display !== 'none';
+              });
+            }
+            """,
+            timeout=60000,
+        )
+    except Exception:
+        pass
     help_el = page.locator('span.help-block').filter(has_text="código de su sistema interno")
     if help_el.count() > 0:
         help_el.first.click()
-    page.wait_for_timeout(1000)
-    page.locator("#publicacion-continuar").click()
-    page.wait_for_url("**paso=3**", timeout=90000)
+    page.wait_for_timeout(3000)
+    print(f"[{index}/{total}] Enviando publicación...", flush=True)
+    btn_continuar = page.locator("#publicacion-continuar")
+    try:
+        btn_continuar.wait_for(state="visible", timeout=60000)
+    except Exception:
+        pass
+    for intento in range(5):
+        try:
+            btn_continuar.click(timeout=10000, no_wait_after=True)
+        except Exception as ex:
+            print(f"[DEBUG] Click falló intento {intento + 1}: {ex}", flush=True)
+            if intento == 4:
+                btn_continuar.click(timeout=10000, force=True, no_wait_after=True)
+            else:
+                page.wait_for_timeout(2000)
+                continue
+        page.wait_for_timeout(400)
+        btn = page.locator("#publicacion-continuar")
+        if btn.count() > 0:
+            span = btn.locator("span.text")
+            if span.count() > 0 and "enviando" in (span.first.inner_text() or "").lower():
+                break
+            if btn.first.get_attribute("disabled"):
+                break
+        else:
+            break
+    try:
+        page.wait_for_url("**paso=3**", timeout=120000, wait_until="domcontentloaded")
+    except PlaywrightTimeout:
+        print(f"[{index}/{total}] La página no redirigió a paso=3 (sigue en {page.url}). Revisá si hay errores de validación o el sitio no respondió.", flush=True)
+        raise
     titulo = _get(product, "titulo", "Título") or "sin título"
-    print(f"Producto ({titulo}) publicado correctamente {index} de {total}", flush=True)
-    page.wait_for_timeout(2000)
-
-    page.locator('a[href*="publicacion.asp"]').filter(has_text="otro anuncio").first.click()
-    page.wait_for_url("**/publicacion.asp**")
+    print(f"[{index}/{total}] OK - Producto publicado: {titulo}", flush=True)
+    page.goto(f"{AGROADS_BASE_URL}/miembros/publicacion.asp")
     page.wait_for_load_state("domcontentloaded")
 
 
@@ -296,11 +365,20 @@ def _fill_marca(page: Page, product: dict):
     if not val:
         return
     sel = page.locator("#publicacion-marca")
-    target = _normalize_text(str(val))
+    raw = str(val).strip().replace("--&gt;", "").replace("-->", "").replace("->", "").strip()
+    target = _normalize_text(raw)
+    if target == "otra marca" or target.startswith("otra marca"):
+        sel.select_option(value="0")
+        page.wait_for_timeout(1000)
+        return
     for opt in sel.locator("option").all():
         try:
             txt = opt.inner_text()
-            if txt and target in _normalize_text(txt):
+            if not txt:
+                continue
+            opt_raw = txt.replace("-->", "").replace("->", "").strip()
+            opt_norm = _normalize_text(opt_raw)
+            if target == opt_norm or (target in opt_norm or opt_norm in target):
                 sel.select_option(value=opt.get_attribute("value"))
                 break
         except Exception:
@@ -310,9 +388,27 @@ def _fill_marca(page: Page, product: dict):
 
 def _fill_anio(page: Page, product: dict):
     val = _get(product, "ano", "año", "anio", "Año")
-    if not val:
+    if not val or str(val).strip() == "":
         return
-    page.locator("#publicacion-ano").select_option(value=str(int(val)))
+    val_str = str(val).strip()
+    v_norm = _normalize_text(val_str)
+    if v_norm in ("no lo se", "no lo sé", "no se"):
+        page.locator("#publicacion-ano").select_option(value="0")
+        return
+    try:
+        anio = int(float(val_str))
+        page.locator("#publicacion-ano").select_option(value=str(anio))
+    except (ValueError, TypeError):
+        sel = page.locator("#publicacion-ano")
+        for opt in sel.locator("option").all():
+            try:
+                if _normalize_text(opt.inner_text()) == v_norm:
+                    sel.select_option(value=opt.get_attribute("value"))
+                    return
+            except Exception:
+                continue
+        if page.locator("#publicacion-ano option[value='0']").count() > 0:
+            page.locator("#publicacion-ano").select_option(value="0")
 
 
 def _fill_modelo(page: Page, product: dict):
@@ -329,13 +425,13 @@ def _fill_modelo(page: Page, product: dict):
     page.wait_for_timeout(800)
     val = _get(product, "modelo", "Modelo")
     if val:
-        target = _normalize_text(str(val))
+        target = _normalize_modelo(str(val))
         for opt in modelo_sel.locator("option").all():
             try:
                 txt = opt.inner_text()
                 if not txt or opt.get_attribute("value") == "":
                     continue
-                if _normalize_text(txt) == target:
+                if _normalize_modelo(txt) == target:
                     modelo_sel.select_option(value=opt.get_attribute("value"))
                     return
             except Exception:
@@ -354,6 +450,22 @@ def _fill_hp(page: Page, product: dict):
     val = _get(product, "hp", "HP")
     if val is not None and str(val).strip() != "":
         hp_el.fill(str(val).strip())
+
+
+def _fill_combustible(page: Page, product: dict):
+    val = _get(product, "combustible", "Combustible")
+    if not val or str(val).strip() == "":
+        return
+    sel = page.locator("#publicacion-combustible")
+    if sel.count() == 0:
+        return
+    v = _normalize_text(str(val))
+    if v in ("nafta", "1"):
+        sel.select_option(value="1")
+    elif v in ("diesel", "gasoil", "2"):
+        sel.select_option(value="2")
+    elif "gnc" in v or "nafta y gnc" in v or v == "3":
+        sel.select_option(value="3")
 
 
 def _fill_horas(page: Page, product: dict):
@@ -380,7 +492,7 @@ def _fill_descripcion(page: Page, product: dict):
 def _fill_ubicacion(page: Page, product: dict):
     val = _get(product, "ubicacion", "ubicación", "Ubicacion", "Ubicación")
     if not val or str(val).strip() == "":
-        val = "Córdoba, Córdoba"
+        val = "Hernando, Córdoba, Argentina"
     ubic_el = page.locator("#publicacion-ubicacion")
     if ubic_el.count() > 0:
         ubic_el.first.fill(str(val).strip())
@@ -413,6 +525,7 @@ def _fill_form(page: Page, product: dict, images_folder: Path):
     _fill_anio(page, product)
     _fill_hp(page, product)
     _fill_horas(page, product)
+    _fill_combustible(page, product)
     _fill_descripcion(page, product)
     _fill_ubicacion(page, product)
 
