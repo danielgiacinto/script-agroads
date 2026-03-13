@@ -122,15 +122,19 @@ def _publish_product(page: Page, product: dict, images_folder: Path, index: int 
                 const cargando = li.querySelector('.foto-cargando');
                 const ok = li.querySelector('.foto-ok.imagen-sube');
                 const pct = cargando && cargando.querySelector('.porcentaje');
+                const inputNueva = li.querySelector('input[name$="-nueva"]');
                 const cargandoVisible = cargando && getComputedStyle(cargando).display !== 'none';
                 if (cargandoVisible) return false;
                 if (pct && pct.textContent.trim() !== '100%') return false;
-                return !!ok && getComputedStyle(ok).display !== 'none';
+                if (!ok || getComputedStyle(ok).display === 'none') return false;
+                if (inputNueva && inputNueva.value === 'si') return false;
+                return true;
               });
             }
             """,
-            timeout=60000,
+            timeout=90000,
         )
+        page.wait_for_timeout(10000)
     except Exception:
         pass
     help_el = page.locator('span.help-block').filter(has_text="código de su sistema interno")
