@@ -186,24 +186,36 @@ def _select_category(page: Page, product: dict):
 
     if categoria:
         _click_text_ignoring_accents(page, categoria)
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(800)
     if _click_continuar_if_visible(page):
         return
     if tipo:
         _click_text_ignoring_accents(page, tipo)
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(800)
     if _click_continuar_if_visible(page):
         return
     if sub_tipo:
         _click_text_ignoring_accents(page, sub_tipo)
-        page.wait_for_timeout(500)
+        page.wait_for_timeout(800)
     if _click_continuar_if_visible(page):
         return
     if sub_sub_tipo:
         _click_text_ignoring_accents(page, sub_sub_tipo)
-        page.wait_for_timeout(500)
-    page.get_by_role("button", name="Continuar").wait_for(state="visible", timeout=5000)
-    page.get_by_role("button", name="Continuar").click()
+        page.wait_for_timeout(800)
+    if _click_continuar_if_visible(page):
+        return
+    btn_cont = page.get_by_role("button", name="Continuar")
+    try:
+        page.wait_for_timeout(1500)
+        btn_cont.wait_for(state="visible", timeout=30000)
+        btn_cont.scroll_into_view_if_needed()
+        btn_cont.click()
+    except PlaywrightTimeout:
+        print(
+            f"No apareció el botón Continuar. Revisá en el Excel categoría/tipo/subtipo para este ítem. URL: {page.url}",
+            flush=True,
+        )
+        raise
 
 
 def _click_text_ignoring_accents(page: Page, text: str):
@@ -236,7 +248,8 @@ def _click_text_ignoring_accents(page: Page, text: str):
 def _click_continuar_if_visible(page: Page) -> bool:
     btn = page.get_by_role("button", name="Continuar")
     try:
-        btn.wait_for(state="visible", timeout=2000)
+        btn.wait_for(state="visible", timeout=8000)
+        btn.scroll_into_view_if_needed()
         btn.click()
         return True
     except Exception:
