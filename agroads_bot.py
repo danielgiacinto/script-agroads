@@ -17,6 +17,10 @@ def _normalize_modelo(s: str) -> str:
     t = str(s).strip()
     for c in ("›", "»", "‹", "«"):
         t = t.replace(c, ">")
+    for c in ("–", "—", "−", "‑", "‒", "﹘", "﹣", "－"):
+        t = t.replace(c, "-")
+    t = t.replace("-", " ")
+    t = re.sub(r"[^\w\s]", " ", t)
     t = re.sub(r"\s+", " ", t)
     return _normalize_text(t)
 
@@ -63,12 +67,24 @@ def run(executable_path: Path, images_folder: Path):
         except Exception:
             pass
 
+        failed_products = []
         for i, product in enumerate(products):
             try:
                 _publish_product(page, product, images_folder, index=i + 1, total=len(products))
             except Exception as e:
-                print(f"Error publicando producto {i + 1}: {e}")
-                raise
+                titulo_fail = _get(product, "titulo", "Título") or "sin título"
+                print(f"Error publicando producto {i + 1}: {e}", flush=True)
+                failed_products.append((i + 1, titulo_fail, str(e)))
+                try:
+                    page.goto(
+                        f"{AGROADS_BASE_URL}/miembros/publicacion.asp",
+                        wait_until="domcontentloaded",
+                        timeout=120000,
+                    )
+                    page.wait_for_load_state("domcontentloaded")
+                except Exception:
+                    pass
+                continue
             if i < len(products) - 1:
                 time.sleep(DELAY_SECONDS)
 
@@ -79,6 +95,10 @@ def run(executable_path: Path, images_folder: Path):
             print(f"Proceso finalizado correctamente. Tiempo total: {mins} min {secs} seg", flush=True)
         else:
             print(f"Proceso finalizado correctamente. Tiempo total: {int(elapsed)} seg", flush=True)
+        if failed_products:
+            print(f"Productos con error: {len(failed_products)}", flush=True)
+            for idx, titulo_fail, err in failed_products:
+                print(f"- [{idx}] {titulo_fail} -> {err}", flush=True)
 
         if browser:
             browser.close()
@@ -132,49 +152,106 @@ def _publish_product(page: Page, product: dict, images_folder: Path, index: int 
               });
             }
             """,
-            timeout=90000,
+            timeout=300000,
         )
-        page.wait_for_timeout(10000)
+        page.wait_for_timeout(120000)
     except Exception:
         pass
     help_el = page.locator('span.help-block').filter(has_text="código de su sistema interno")
     if help_el.count() > 0:
         help_el.first.click()
-    page.wait_for_timeout(3000)
-    print(f"[{index}/{total}] Enviando publicación...", flush=True)
+    page.wait_for_timeout(30000)
     btn_continuar = page.locator("#publicacion-continuar")
     try:
         btn_continuar.wait_for(state="visible", timeout=60000)
     except Exception:
         pass
+    publicar_log = False
     for intento in range(5):
         try:
             btn_continuar.click(timeout=10000, no_wait_after=True)
+            if not publicar_log:
+                print(f"[{index}/{total}] Enviando publicación...", flush=True)
+                publicar_log = True
         except Exception as ex:
             print(f"[DEBUG] Click falló intento {intento + 1}: {ex}", flush=True)
             if intento == 4:
                 btn_continuar.click(timeout=10000, force=True, no_wait_after=True)
+                if not publicar_log:
+                    print(f"[{index}/{total}] Enviando publicación...", flush=True)
+                    publicar_log = True
             else:
                 page.wait_for_timeout(2000)
                 continue
         page.wait_for_timeout(400)
         btn = page.locator("#publicacion-continuar")
         if btn.count() > 0:
-            span = btn.locator("span.text")
-            if span.count() > 0 and "enviando" in (span.first.inner_text() or "").lower():
-                break
-            if btn.first.get_attribute("disabled"):
-                break
+            try:
+                span = btn.locator("span.text")
+                if span.count() > 0 and "enviando" in (span.first.inner_text(timeout=3000) or "").lower():
+                    break
+            except Exception:
+                pass
+            try:
+                if page.evaluate(
+                    """() => {
+                      const b = document.querySelector('#publicacion-continuar');
+                      return !!(b && b.hasAttribute('disabled'));
+                    }"""
+                ):
+                    break
+            except Exception:
+                pass
         else:
             break
+    _url_publicacion_ok = re.compile(r".*(paso=3|panel_de_control\.asp).*")
+
+    def _esperar_post_publicar() -> None:
+        page.wait_for_url(_url_publicacion_ok, timeout=120000, wait_until="domcontentloaded")
+
+    ultimo_timeout: BaseException | None = None
     try:
-        page.wait_for_url("**paso=3**", timeout=120000, wait_until="domcontentloaded")
-    except PlaywrightTimeout:
-        print(f"[{index}/{total}] La página no redirigió a paso=3 (sigue en {page.url}). Revisá si hay errores de validación o el sitio no respondió.", flush=True)
-        raise
+        _esperar_post_publicar()
+    except PlaywrightTimeout as e_pub:
+        ultimo_timeout = e_pub
+        if "paso=2" not in page.url:
+            print(
+                f"[{index}/{total}] La página no redirigió a paso=3/panel de control (sigue en {page.url}).",
+                flush=True,
+            )
+            raise
+        for reintento in range(3):
+            btn_reintento = page.locator("#publicacion-continuar")
+            if btn_reintento.count() == 0:
+                print(
+                    f"[{index}/{total}] No se pudo completar la publicación (sigue en {page.url}).",
+                    flush=True,
+                )
+                raise ultimo_timeout
+            page.wait_for_timeout(4000 * (reintento + 1))
+            try:
+                btn_reintento.first.click(timeout=15000, force=True, no_wait_after=True)
+            except Exception:
+                pass
+            try:
+                _esperar_post_publicar()
+                ultimo_timeout = None
+                break
+            except PlaywrightTimeout as e2:
+                ultimo_timeout = e2
+                if reintento == 2:
+                    print(
+                        f"[{index}/{total}] No se pudo completar la publicación (sigue en {page.url}).",
+                        flush=True,
+                    )
+                    raise ultimo_timeout
     titulo = _get(product, "titulo", "Título") or "sin título"
     print(f"[{index}/{total}] OK - Producto publicado: {titulo}", flush=True)
-    page.goto(f"{AGROADS_BASE_URL}/miembros/publicacion.asp")
+    page.goto(
+        f"{AGROADS_BASE_URL}/miembros/publicacion.asp",
+        wait_until="domcontentloaded",
+        timeout=120000,
+    )
     page.wait_for_load_state("domcontentloaded")
 
 
@@ -388,6 +465,7 @@ def _fill_marca(page: Page, product: dict):
         sel.select_option(value="0")
         page.wait_for_timeout(1000)
         return
+    match_parcial = None
     for opt in sel.locator("option").all():
         try:
             txt = opt.inner_text()
@@ -395,11 +473,17 @@ def _fill_marca(page: Page, product: dict):
                 continue
             opt_raw = txt.replace("-->", "").replace("->", "").strip()
             opt_norm = _normalize_text(opt_raw)
-            if target == opt_norm or (target in opt_norm or opt_norm in target):
-                sel.select_option(value=opt.get_attribute("value"))
-                break
+            opt_value = opt.get_attribute("value")
+            if target == opt_norm:
+                sel.select_option(value=opt_value)
+                page.wait_for_timeout(1000)
+                return
+            if match_parcial is None and target in opt_norm:
+                match_parcial = opt_value
         except Exception:
             continue
+    if match_parcial:
+        sel.select_option(value=match_parcial)
     page.wait_for_timeout(1000)
 
 
@@ -429,6 +513,41 @@ def _fill_anio(page: Page, product: dict):
 
 
 def _fill_modelo(page: Page, product: dict):
+    def _modelo_en_error() -> bool:
+        sel = page.locator("#publicacion-modelo")
+        if sel.count() == 0:
+            return False
+        if (sel.first.get_attribute("aria-invalid") or "").lower() == "true":
+            return True
+        err = page.locator("#publicacion-modelo-error")
+        if err.count() > 0 and err.first.is_visible():
+            txt = (err.first.inner_text() or "").strip().lower()
+            if "debe seleccionar el modelo" in txt:
+                return True
+        return False
+
+    def _aplicar_modelo(value: str | None, label: str | None) -> bool:
+        modelo_sel_local = page.locator("#publicacion-modelo")
+        try:
+            if value:
+                modelo_sel_local.select_option(value=value)
+            elif label:
+                modelo_sel_local.select_option(label=label)
+            else:
+                return False
+            page.wait_for_timeout(250)
+            if _modelo_en_error():
+                modelo_sel_local.click()
+                page.wait_for_timeout(150)
+                if value:
+                    modelo_sel_local.select_option(value=value)
+                elif label:
+                    modelo_sel_local.select_option(label=label)
+                page.wait_for_timeout(250)
+            return not _modelo_en_error()
+        except Exception:
+            return False
+
     modelo_sel = page.locator("#publicacion-modelo")
     try:
         modelo_sel.wait_for(state="visible", timeout=3000)
@@ -446,19 +565,17 @@ def _fill_modelo(page: Page, product: dict):
         for opt in modelo_sel.locator("option").all():
             try:
                 txt = opt.inner_text()
-                if not txt or opt.get_attribute("value") == "":
+                opt_value = opt.get_attribute("value")
+                if not txt or opt_value == "":
                     continue
                 if _normalize_modelo(txt) == target:
-                    modelo_sel.select_option(value=opt.get_attribute("value"))
-                    return
+                    if _aplicar_modelo(opt_value, None):
+                        return
             except Exception:
                 continue
-        try:
-            modelo_sel.select_option(label=str(val))
+        if _aplicar_modelo(None, str(val)):
             return
-        except Exception:
-            pass
-    modelo_sel.select_option(value="0")
+    _aplicar_modelo("0", None)
 
 def _fill_hp(page: Page, product: dict):
     hp_el = page.locator("#publicacion-hp")
