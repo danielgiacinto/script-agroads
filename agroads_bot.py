@@ -35,6 +35,179 @@ from config import (
 from excel_reader import read_products
 from image_handler import get_images_for_product
 
+_CATEGORY_ALIASES: dict[str, list[str]] = {
+    "elevdores": ["Elevadores", "Elevdores"],
+}
+
+MIN_ESPERA_TRAS_FOTOS_SEG = 15
+FOTOS_POLL_MS = 1000
+FOTOS_TIMEOUT_SEG = 600
+
+
+def _page_en_error_red(page: Page) -> bool:
+    return "chrome-error://" in page.url or page.url.startswith("about:")
+
+
+def _recuperar_si_error_red(page: Page, url_fallback: str) -> None:
+    if _page_en_error_red(page):
+        page.goto(url_fallback, wait_until="domcontentloaded", timeout=120000)
+        page.wait_for_load_state("domcontentloaded")
+
+
+def _cantidad_fotos_esperadas(product: dict, images_folder: Path) -> int:
+    product_id = _get(product, "id", "ID")
+    if not product_id:
+        return 0
+    imagenes = get_images_for_product(images_folder, product_id)
+    return min(len(imagenes), 10) if imagenes else 0
+
+
+def _estado_fotos_subida(page: Page) -> dict:
+    return page.evaluate(
+        """
+        () => {
+          const items = Array.from(document.querySelectorAll('ul.ui-sortable li.imagen'));
+          let listas = 0;
+          let enCarga = 0;
+          for (const li of items) {
+            const fotoCargando = li.querySelector('.foto-cargando');
+            const ok = li.querySelector('.foto-ok.imagen-sube');
+            const pct = fotoCargando && fotoCargando.querySelector('.porcentaje');
+            const inputNueva = li.querySelector('input[name$="-nueva"]');
+            const cargandoVisible = fotoCargando && getComputedStyle(fotoCargando).display !== 'none';
+            const pctText = pct ? pct.textContent.trim() : '';
+            if (cargandoVisible || (pctText && pctText !== '100%')) {
+              enCarga++;
+              continue;
+            }
+            if (!ok || getComputedStyle(ok).display === 'none') {
+              enCarga++;
+              continue;
+            }
+            if (inputNueva && inputNueva.value === 'si') {
+              enCarga++;
+              continue;
+            }
+            listas++;
+          }
+          return { total: items.length, listas, en_carga: enCarga };
+        }
+        """
+    )
+
+
+def _esperar_fotos_listas(
+    page: Page,
+    cantidad_esperada: int,
+    index: int,
+    total: int,
+    timeout_seg: int = FOTOS_TIMEOUT_SEG,
+) -> None:
+    if cantidad_esperada <= 0:
+        return
+
+    print(
+        f"[{index}/{total}] Esperando subida de {cantidad_esperada} foto(s)...",
+        flush=True,
+    )
+    inicio = time.time()
+    ultimo_log = -1
+    ultimo_log_tiempo = 0.0
+
+    while time.time() - inicio < timeout_seg:
+        estado = _estado_fotos_subida(page)
+        listas = int(estado["listas"])
+        total_dom = int(estado["total"])
+        en_carga = int(estado["en_carga"])
+
+        if listas != ultimo_log or time.time() - ultimo_log_tiempo >= 10:
+            extra = f" ({en_carga} en carga)" if en_carga else ""
+            print(
+                f"[{index}/{total}] Fotos: {listas}/{cantidad_esperada} listas{extra}",
+                flush=True,
+            )
+            ultimo_log = listas
+            ultimo_log_tiempo = time.time()
+
+        if total_dom >= cantidad_esperada and listas >= cantidad_esperada:
+            print(
+                f"[{index}/{total}] Fotos: {listas}/{cantidad_esperada} — todas listas.",
+                flush=True,
+            )
+            return
+
+        page.wait_for_timeout(FOTOS_POLL_MS)
+
+    estado_final = _estado_fotos_subida(page)
+    raise PlaywrightTimeout(
+        f"Timeout esperando fotos: {estado_final['listas']}/{cantidad_esperada} listas "
+        f"({estado_final['total']} en pantalla, {estado_final['en_carga']} en carga)"
+    )
+
+
+def _intentar_click_publicar(page: Page, btn_continuar, *, force: bool = False) -> bool:
+    try:
+        btn_continuar.first.scroll_into_view_if_needed()
+        btn_continuar.first.click(timeout=30000, force=force, no_wait_after=True)
+        return True
+    except Exception:
+        if not force:
+            return False
+        try:
+            return bool(
+                page.evaluate(
+                    """() => {
+                      const b = document.querySelector('#publicacion-continuar');
+                      if (!b) return false;
+                      b.click();
+                      return true;
+                    }"""
+                )
+            )
+        except Exception:
+            return False
+
+
+def _url_seleccion_categoria() -> str:
+    return f"{AGROADS_BASE_URL}/miembros/publicacion.asp"
+
+
+def _ir_a_seleccion_categoria(page: Page) -> None:
+    if "publicacion.asp" in page.url and "paso=" not in page.url:
+        _esperar_pantalla_categoria_lista(page)
+        return
+    page.goto(_url_seleccion_categoria(), wait_until="domcontentloaded", timeout=60000)
+    _esperar_pantalla_categoria_lista(page)
+
+
+def _esperar_pantalla_categoria_lista(page: Page) -> None:
+    try:
+        page.locator("button.category-button").first.wait_for(state="visible", timeout=15000)
+        return
+    except Exception:
+        pass
+    page.get_by_role("button", name="Continuar").wait_for(state="visible", timeout=10000)
+
+
+def _esperar_tras_seleccion_categoria(page: Page) -> None:
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=3000)
+    except Exception:
+        pass
+    try:
+        page.wait_for_function(
+            """() => {
+              const btns = document.querySelectorAll('button.category-button');
+              const continuar = Array.from(document.querySelectorAll('button')).find(
+                b => /^\\s*continuar\\s*$/i.test(b.textContent)
+              );
+              return btns.length > 0 || (continuar && continuar.offsetParent !== null);
+            }""",
+            timeout=5000,
+        )
+    except Exception:
+        page.wait_for_timeout(200)
+
 
 def run(executable_path: Path, images_folder: Path):
     if getattr(sys, "frozen", False):
@@ -76,12 +249,7 @@ def run(executable_path: Path, images_folder: Path):
                 print(f"Error publicando producto {i + 1}: {e}", flush=True)
                 failed_products.append((i + 1, titulo_fail, str(e)))
                 try:
-                    page.goto(
-                        f"{AGROADS_BASE_URL}/miembros/publicacion.asp",
-                        wait_until="domcontentloaded",
-                        timeout=120000,
-                    )
-                    page.wait_for_load_state("domcontentloaded")
+                    _ir_a_seleccion_categoria(page)
                 except Exception:
                     pass
                 continue
@@ -95,8 +263,15 @@ def run(executable_path: Path, images_folder: Path):
             print(f"Proceso finalizado correctamente. Tiempo total: {mins} min {secs} seg", flush=True)
         else:
             print(f"Proceso finalizado correctamente. Tiempo total: {int(elapsed)} seg", flush=True)
+        total_prod = len(products)
+        fallidos = len(failed_products)
+        exitos = total_prod - fallidos
+        print(
+            f"Resumen: Total productos: {total_prod}. Publicados con éxito: {exitos}. No publicados: {fallidos}.",
+            flush=True,
+        )
         if failed_products:
-            print(f"Productos con error: {len(failed_products)}", flush=True)
+            print(f"Detalle de errores ({len(failed_products)}):", flush=True)
             for idx, titulo_fail, err in failed_products:
                 print(f"- [{idx}] {titulo_fail} -> {err}", flush=True)
 
@@ -119,95 +294,67 @@ def _publish_product(page: Page, product: dict, images_folder: Path, index: int 
     if len(titulo_short) > 50:
         titulo_short = titulo_short[:47] + "..."
     print(f"[{index}/{total}] Procesando: {titulo_short}", flush=True)
-    if "/publicacion.asp" not in page.url:
-        page.get_by_role("link", name="Publicar", exact=True).click()
-        page.wait_for_url("**/publicacion.asp**")
-    page.wait_for_load_state("domcontentloaded")
+    _ir_a_seleccion_categoria(page)
 
-    _select_category(page, product)
-    page.wait_for_url("**paso=2**")
-    page.wait_for_load_state("domcontentloaded")
+    for intento_cat in range(2):
+        try:
+            _select_category(page, product)
+            break
+        except Exception as e_cat:
+            err = str(e_cat).lower()
+            if intento_cat == 0 and (
+                "detached" in err or "err_aborted" in err or "aborted" in err
+            ):
+                _ir_a_seleccion_categoria(page)
+                continue
+            raise
+    if "paso=2" not in page.url:
+        page.wait_for_url("**paso=2**", timeout=30000)
+    cantidad_fotos = _subir_fotos_y_esperar(page, product, images_folder, index, total)
+
     print(f"[{index}/{total}] Completando formulario...", flush=True)
-
     _fill_form(page, product, images_folder)
 
-    print(f"[{index}/{total}] Esperando que las fotos terminen de subir...", flush=True)
-    try:
-        page.wait_for_function(
-            """
-            () => {
-              const items = Array.from(document.querySelectorAll('ul.ui-sortable li.imagen[data-nueva]'));
-              if (items.length === 0) return true;
-              return items.every(li => {
-                const cargando = li.querySelector('.foto-cargando');
-                const ok = li.querySelector('.foto-ok.imagen-sube');
-                const pct = cargando && cargando.querySelector('.porcentaje');
-                const inputNueva = li.querySelector('input[name$="-nueva"]');
-                const cargandoVisible = cargando && getComputedStyle(cargando).display !== 'none';
-                if (cargandoVisible) return false;
-                if (pct && pct.textContent.trim() !== '100%') return false;
-                if (!ok || getComputedStyle(ok).display === 'none') return false;
-                if (inputNueva && inputNueva.value === 'si') return false;
-                return true;
-              });
-            }
-            """,
-            timeout=300000,
-        )
-        page.wait_for_timeout(120000)
-    except Exception:
-        pass
     help_el = page.locator('span.help-block').filter(has_text="código de su sistema interno")
     if help_el.count() > 0:
         help_el.first.click()
-    page.wait_for_timeout(30000)
+
+    if cantidad_fotos > 0:
+        print(
+            f"[{index}/{total}] Espera de seguridad de {MIN_ESPERA_TRAS_FOTOS_SEG} seg "
+            f"tras {cantidad_fotos}/{cantidad_fotos} fotos...",
+            flush=True,
+        )
+        page.wait_for_timeout(MIN_ESPERA_TRAS_FOTOS_SEG * 1000)
+
+    _recuperar_si_error_red(page, f"{AGROADS_BASE_URL}/miembros/publicacion.asp?paso=2")
     btn_continuar = page.locator("#publicacion-continuar")
-    try:
-        btn_continuar.wait_for(state="visible", timeout=60000)
-    except Exception:
-        pass
-    publicar_log = False
+    btn_continuar.wait_for(state="visible", timeout=60000)
+    btn_continuar.first.scroll_into_view_if_needed()
+    clic_publicar = False
     for intento in range(5):
-        try:
-            btn_continuar.click(timeout=10000, no_wait_after=True)
-            if not publicar_log:
-                print(f"[{index}/{total}] Enviando publicación...", flush=True)
-                publicar_log = True
-        except Exception as ex:
-            print(f"[DEBUG] Click falló intento {intento + 1}: {ex}", flush=True)
-            if intento == 4:
-                btn_continuar.click(timeout=10000, force=True, no_wait_after=True)
-                if not publicar_log:
-                    print(f"[{index}/{total}] Enviando publicación...", flush=True)
-                    publicar_log = True
-            else:
-                page.wait_for_timeout(2000)
-                continue
-        page.wait_for_timeout(400)
-        btn = page.locator("#publicacion-continuar")
-        if btn.count() > 0:
-            try:
-                span = btn.locator("span.text")
-                if span.count() > 0 and "enviando" in (span.first.inner_text(timeout=3000) or "").lower():
-                    break
-            except Exception:
-                pass
-            try:
-                if page.evaluate(
-                    """() => {
-                      const b = document.querySelector('#publicacion-continuar');
-                      return !!(b && b.hasAttribute('disabled'));
-                    }"""
-                ):
-                    break
-            except Exception:
-                pass
-        else:
+        _recuperar_si_error_red(page, f"{AGROADS_BASE_URL}/miembros/publicacion.asp?paso=2")
+        btn_continuar = page.locator("#publicacion-continuar")
+        if btn_continuar.count() == 0:
+            page.wait_for_timeout(2000)
+            continue
+        if _intentar_click_publicar(page, btn_continuar, force=intento == 4):
+            print(f"[{index}/{total}] Enviando publicación...", flush=True)
+            clic_publicar = True
             break
-    _url_publicacion_ok = re.compile(r".*(paso=3|panel_de_control\.asp).*")
+        print(
+            f"[{index}/{total}] No se pudo hacer clic en publicar (intento {intento + 1}/5)",
+            flush=True,
+        )
+        page.wait_for_timeout(2000)
+    if not clic_publicar:
+        raise PlaywrightTimeout("No se pudo hacer clic en #publicacion-continuar")
+    _url_publicacion_ok = re.compile(r".*(paso=3|panel_de_control\.asp|/central).*")
 
     def _esperar_post_publicar() -> None:
         page.wait_for_url(_url_publicacion_ok, timeout=120000, wait_until="domcontentloaded")
+        if _page_en_error_red(page):
+            raise PlaywrightTimeout("La navegación terminó en página de error del navegador")
 
     ultimo_timeout: BaseException | None = None
     try:
@@ -216,11 +363,12 @@ def _publish_product(page: Page, product: dict, images_folder: Path, index: int 
         ultimo_timeout = e_pub
         if "paso=2" not in page.url:
             print(
-                f"[{index}/{total}] La página no redirigió a paso=3/panel de control (sigue en {page.url}).",
+                f"[{index}/{total}] La página no redirigió a paso=3/panel/central (sigue en {page.url}).",
                 flush=True,
             )
             raise
         for reintento in range(3):
+            _recuperar_si_error_red(page, f"{AGROADS_BASE_URL}/miembros/publicacion.asp?paso=2")
             btn_reintento = page.locator("#publicacion-continuar")
             if btn_reintento.count() == 0:
                 print(
@@ -247,46 +395,32 @@ def _publish_product(page: Page, product: dict, images_folder: Path, index: int 
                     raise ultimo_timeout
     titulo = _get(product, "titulo", "Título") or "sin título"
     print(f"[{index}/{total}] OK - Producto publicado: {titulo}", flush=True)
-    page.goto(
-        f"{AGROADS_BASE_URL}/miembros/publicacion.asp",
-        wait_until="domcontentloaded",
-        timeout=120000,
-    )
-    page.wait_for_load_state("domcontentloaded")
+    _ir_a_seleccion_categoria(page)
 
 
 def _select_category(page: Page, product: dict):
-    categoria = _get(product, "categoria", "Categoria")
-    tipo = _get(product, "tipo", "Tipo")
-    sub_tipo = _get(product, "sub_tipo", "sub tipo", "Sub_tipo")
-    sub_sub_tipo = _get(product, "sub_sub_tipo", "sub sub tipo", "Sub_sub_tipo")
+    niveles = [
+        _get(product, "categoria", "Categoria"),
+        _get(product, "tipo", "Tipo"),
+        _get(product, "sub_tipo", "sub tipo", "Sub_tipo"),
+        _get(product, "sub_sub_tipo", "sub sub tipo", "Sub_sub_tipo"),
+    ]
 
-    if categoria:
-        _click_text_ignoring_accents(page, categoria)
-        page.wait_for_timeout(800)
-    if _click_continuar_if_visible(page):
-        return
-    if tipo:
-        _click_text_ignoring_accents(page, tipo)
-        page.wait_for_timeout(800)
-    if _click_continuar_if_visible(page):
-        return
-    if sub_tipo:
-        _click_text_ignoring_accents(page, sub_tipo)
-        page.wait_for_timeout(800)
-    if _click_continuar_if_visible(page):
-        return
-    if sub_sub_tipo:
-        _click_text_ignoring_accents(page, sub_sub_tipo)
-        page.wait_for_timeout(800)
-    if _click_continuar_if_visible(page):
-        return
+    for nivel in niveles:
+        if not nivel:
+            continue
+        _esperar_pantalla_categoria_lista(page)
+        _click_text_ignoring_accents(page, nivel)
+        _esperar_tras_seleccion_categoria(page)
+        if _click_continuar_if_visible(page):
+            return
+
     btn_cont = page.get_by_role("button", name="Continuar")
     try:
-        page.wait_for_timeout(1500)
-        btn_cont.wait_for(state="visible", timeout=30000)
+        btn_cont.wait_for(state="visible", timeout=15000)
         btn_cont.scroll_into_view_if_needed()
         btn_cont.click()
+        page.wait_for_url("**paso=2**", timeout=30000)
     except PlaywrightTimeout:
         print(
             f"No apareció el botón Continuar. Revisá en el Excel categoría/tipo/subtipo para este ítem. URL: {page.url}",
@@ -295,39 +429,75 @@ def _select_category(page: Page, product: dict):
         raise
 
 
+def _category_text_variants(text: str) -> list[str]:
+    variants = [text]
+    key = _normalize_text(text)
+    for alias in _CATEGORY_ALIASES.get(key, []):
+        if alias not in variants:
+            variants.append(alias)
+    return variants
+
+
 def _click_text_ignoring_accents(page: Page, text: str):
     def _match(a: str, b: str) -> bool:
         na, nb = _normalize_text(a), _normalize_text(b)
         if na == nb:
             return True
         short, long = (na, nb) if len(na) <= len(nb) else (nb, na)
-        return long.startswith(short)
-    buttons = page.locator("button.category-button")
-    for i in range(buttons.count()):
+        if long.startswith(short):
+            return True
+        if len(short) >= 5 and short in long:
+            return True
+        return False
+
+    for variant in _category_text_variants(text):
+        buttons = page.locator("button.category-button")
+        for i in range(buttons.count()):
+            try:
+                btn = buttons.nth(i)
+                name_el = btn.locator("span.category-name")
+                if name_el.count() > 0 and _match(variant, name_el.first.inner_text()):
+                    btn.click()
+                    return
+            except Exception:
+                continue
+        for el in page.locator("a.ripple, a[href*='seccion.asp']").all():
+            try:
+                if _match(variant, el.inner_text()):
+                    el.click()
+                    return
+            except Exception:
+                continue
         try:
-            btn = buttons.nth(i)
-            name_el = btn.locator("span.category-name")
-            if name_el.count() > 0 and _match(text, name_el.first.inner_text()):
-                btn.click()
-                return
+            loc = page.get_by_text(variant, exact=False).first
+            loc.wait_for(state="visible", timeout=3000)
+            loc.click()
+            return
         except Exception:
             continue
-    for el in page.locator("a.ripple, a[href*='seccion.asp']").all():
+
+    visibles: list[str] = []
+    for btn in page.locator("button.category-button span.category-name").all():
         try:
-            if _match(text, el.inner_text()):
-                el.click()
-                return
+            t = btn.inner_text().strip()
+            if t:
+                visibles.append(t)
         except Exception:
             continue
-    page.get_by_text(text, exact=False).first.click()
+    opciones = ", ".join(visibles[:12]) if visibles else "(ninguna categoría visible)"
+    raise PlaywrightTimeout(
+        f"No se encontró '{text}' en la pantalla de categorías. Opciones visibles: {opciones}"
+    )
 
 
 def _click_continuar_if_visible(page: Page) -> bool:
     btn = page.get_by_role("button", name="Continuar")
     try:
-        btn.wait_for(state="visible", timeout=8000)
-        btn.scroll_into_view_if_needed()
-        btn.click()
+        if btn.count() == 0 or not btn.first.is_visible():
+            return False
+        btn.first.scroll_into_view_if_needed()
+        btn.first.click()
+        page.wait_for_url("**paso=2**", timeout=30000)
         return True
     except Exception:
         return False
@@ -365,76 +535,6 @@ def _fill_dto_pago(page: Page, product: dict):
     val = _get(product, "dto_pago", "dto pago", "descuento")
     if val is not None and str(val).strip() != "":
         page.locator("#publicacion-descuento").fill(str(val).strip())
-
-
-def _fill_condiciones_comerciales(page: Page):
-    try:
-        section = page.locator(".form-section:has(#publicacion-condicion-comercial-10)")
-        if section.count() > 0:
-            section.first.scroll_into_view_if_needed()
-        page.locator("h3.section-title:has-text('Financiación')").first.click()
-        page.wait_for_timeout(300)
-    except Exception:
-        pass
-
-    def _click_icheck(checkbox_id: str):
-        try:
-            box = page.locator(f"div.icheckbox_square:has(input#{checkbox_id})").first
-            if box.count() > 0:
-                box.click(force=True)
-                page.wait_for_timeout(200)
-        except Exception:
-            pass
-
-    try:
-        _click_icheck("publicacion-condicion-comercial-10")
-        val10 = page.locator("#publicacion-condicion-comercial-value-10")
-        if val10.count() > 0:
-            val10.first.fill("6")
-            page.wait_for_timeout(200)
-    except Exception:
-        pass
-    try:
-        _click_icheck("publicacion-condicion-comercial-6")
-        val6 = page.locator("#publicacion-condicion-comercial-value-6")
-        if val6.count() > 0:
-            val6.first.fill("30")
-            page.wait_for_timeout(200)
-    except Exception:
-        pass
-    try:
-        _click_icheck("publicacion-condicion-comercial-9")
-        val9 = page.locator("#publicacion-condicion-comercial-value-9")
-        if val9.count() > 0:
-            val9.first.fill("0")
-            page.wait_for_timeout(200)
-    except Exception:
-        pass
-    try:
-        _click_icheck("publicacion-condicion-comercial-4")
-    except Exception:
-        pass
-    try:
-        _click_icheck("publicacion-condicion-comercial-11")
-    except Exception:
-        pass
-    try:
-        _click_icheck("publicacion-condicion-comercial-2")
-    except Exception:
-        pass
-    try:
-        sel_principal = page.locator("#condicion-comercial-principal")
-        if sel_principal.count() > 0:
-            sel_principal.first.select_option(value="11")
-            page.wait_for_timeout(200)
-    except Exception:
-        pass
-    try:
-        sel_secundaria = page.locator("#condicion-comercial-secundaria")
-        if sel_secundaria.count() > 0:
-            sel_secundaria.first.select_option(value="9")
-    except Exception:
-        pass
 
 
 def _fill_condicion(page: Page, product: dict):
@@ -639,19 +739,36 @@ def _fill_ubicacion(page: Page, product: dict):
             page.keyboard.press("Tab")
 
 
+def _subir_fotos_y_esperar(
+    page: Page,
+    product: dict,
+    images_folder: Path,
+    index: int,
+    total: int,
+) -> int:
+    cantidad_esperada = _cantidad_fotos_esperadas(product, images_folder)
+    if cantidad_esperada <= 0:
+        return 0
+
+    product_id = _get(product, "id", "ID")
+    imagenes = get_images_for_product(images_folder, product_id)
+    if not imagenes:
+        return 0
+
+    print(
+        f"[{index}/{total}] Subiendo {cantidad_esperada} foto(s) antes del formulario...",
+        flush=True,
+    )
+    _upload_images(page, imagenes)
+    _esperar_fotos_listas(page, cantidad_esperada, index, total)
+    return cantidad_esperada
+
+
 def _fill_form(page: Page, product: dict, images_folder: Path):
-    # Llena los campos del formulario de Agroads
     _fill_titulo(page, product)
     _fill_moneda(page, product)
     _fill_monto(page, product)
     _fill_dto_pago(page, product)
-    _fill_condiciones_comerciales(page)
-
-    product_id = _get(product, "id", "ID")
-    if product_id:
-        imagenes = get_images_for_product(images_folder, product_id)
-        if imagenes:
-            _upload_images(page, imagenes)
 
     _fill_condicion(page, product)
     _fill_marca(page, product)
